@@ -1,0 +1,16 @@
+var keystone = require('keystone'); 
+var Types = keystone.Field.Types;;
+var BuildHistory = new keystone.List('BuildHistory');
+BuildHistory.add({
+    name: { type: String, initial: true, default: '', index: true, required: true},
+    branch: { type: String, initial: true, default: '', required: true},
+    executionId: { type: Types.Number, initial: true, default: '', required: true }, 
+    duration: { type: Types.Number, initial: true, default: '', required: true },
+    result: { type: Types.Select, initial: true, options: 'SUCCESS,FAILURE,UNSTABLE,ABORTED,UNKNOWN', default: 'FAILURE', index: true, required: true },
+    buildDateTime: { type: Types.Datetime, initial: true, index: {expires: 31622400}, required: true },
+    changeSets: { type: Types.Textarea, default: '', required: false }
+});
+BuildHistory.defaultSort = 'name, release';
+BuildHistory.defaultColumns = 'name, branch, buildDateTime, result, comment'; 
+BuildHistory.register();
+

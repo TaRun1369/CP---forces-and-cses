@@ -1,0 +1,607 @@
+{% extends "../layouts/default.twig" %}
+
+{% block content %}
+	<style>
+	.greendot {
+		height: 10px;
+		width: 5px;
+		background-color: #0f0;
+		border-radius: 0%;
+		display: inline-block;
+		}
+	.reddot {
+		height: 10px;
+		width: 5px;
+		background-color: #f00;
+		border-radius: 0%;
+		display: inline-block;
+		}
+	.space {
+		height: 10px;
+		width: 2px;
+		background-color: #fff;
+		border-radius: 0%;
+		display: inline-block;
+		}
+	</style>
+	<div class="container">
+		<div class="panel panel-primary">
+			<!-- Default panel contents -->
+			<div class="panel-heading">Environment Summary</div>
+
+			<div class="panel-body">
+			    <form id="form" class="form-horizontal custom-form" action="/environments" method="post">
+				<div class="form-group required">
+					<div class="col-sm-12" style="padding-bottom: 10px">
+						<div class="col-sm-4 label-column">
+							<label for="name-input-field" class="control-label">Environment</label>
+						</div>
+						<div class="col-sm-6 input-column {% if dataidationErrors.host %}has-error{% endif %}"> 
+							<select name="host" class="form-control">
+								{% for host in data.hosts %}
+									{% set selected = "" %}
+									{% if form.host == host._id %}
+										{% set selected = " selected" %}
+									{% endif %}
+									<option dataue="{{ host._id }}"{{ selected }}>{{ host.name }}</option>
+								{% endfor %}
+							</select>
+						</div>
+					</div>
+				</div>
+				
+				<div class="form-group required">
+					<div class="col-sm-12" style="padding-bottom: 10px">
+						<div class="col-sm-4 label-column">
+							<label for="name-input-field" class="control-label">Domain</label>
+							<br>
+                            Note: Domain filter affects plot, snapshot & regression failures
+						</div>
+						<div class="col-sm-6 input-column {% if dataidationErrors.host %}has-error{% endif %}">
+							<select name="domain" class="form-control">
+								{% for domain in data.domains %}
+									{% set selected = "" %}
+									{% if form.domain == domain %}
+										{% set selected = " selected" %}
+									{% endif %}
+									<option dataue="{{ domain }}"{{ selected }}>{{ domain }}</option>
+								{% endfor %}
+							</select>
+						</div>
+					</div>	
+				</div>
+					
+				<div class="form-group required">
+					<div class="col-sm-12">
+						<div class="col-sm-4 label-column">
+							<label for="name-input-field" class="control-label">Priority</label>
+							<br>
+							Note: Priority filter only affects regression failures
+						</div>
+						<div class="col-sm-6 input-column {% if dataidationErrors.host %}has-error{% endif %}">
+							<select name="priority" class="form-control">
+								{% for priority in data.priorities %}
+									{% set selected = "" %}
+									{% if form.priority == priority %}
+										{% set selected = " selected" %}
+									{% endif %}
+									<option dataue="{{ priority }}"{{ selected }}>{{ priority }}</option>
+								{% endfor %}
+							</select>
+						</div>
+					</div>	
+				</div>
+				
+				<!-- Buttons -->
+				<input id="btnSubmit" type="submit" class="btn btn-primary submit-button" dataue="Submit"/>
+				
+				{% if data.plotdata or data.snapshots or data.failures %}
+				<br>
+				<br>
+				Description: {{data.host.description}}<br>
+				{% if data.host.showDates %} 
+				Code Complete Date: {{data.codeCompleteDate|date('j F Y H:i:s')}} AEST<br>
+				Deliver to Bizops Date: {{data.codeReleaseDate|date('j F Y H:i:s')}} AEST<br>
+				{% endif %}
+				Current Release: {{data.host.lastRelease}}<br>
+
+				<div id="plotarea"></div>
+				<script src="/js/plotly/plotly-latest.min.js"></script>
+				<script>
+					plotarea = document.getElementById('plotarea');
+					var layout = {
+						title: 'Test Suite Failures',
+						showlegend: true,
+						yaxis: { 
+							title: 'Test Suites'
+						},
+						xaxis: {},		
+						{% if data.host.showDates %} 
+						shapes: [
+							//line vertical - Code Complete
+							{
+								type: 'line',
+								x0: "{{data.codeCompleteDate|date('Y-m-d H:i:s')}}",
+								y0: 0,
+								x1: "{{data.codeCompleteDate|date('Y-m-d H:i:s')}}",
+								y1: {{(data.failureThreshold + 200)}},
+								line: {
+									color: 'rgb(256, 0, 0)',
+									width: 2,
+									dash: 'dash'
+								}
+							},
+							//line vertical - Deliver to BizOps
+							{
+								type: 'line',
+								x0: "{{data.codeReleaseDate|date('Y-m-d H:i:s')}}",
+								y0: 0,
+								x1: "{{data.codeReleaseDate|date('Y-m-d H:i:s')}}",
+								y1: {{(data.failureThreshold + 200)}},
+								line: {
+									color: 'rgb(256, 0, 0)',
+									width: 2,
+									dash: 'dash'
+								}
+							},
+							//line horizontal - Stop the Line
+							{
+								type: 'line',
+								x0: "{{data.graphStartDate|date('Y-m-d H:i:s')}}",
+								y0: {{data.failureThreshold}},
+								x1: "{{data.codeCompleteDate|date('Y-m-d H:i:s')}}",
+								y1: {{data.failureThreshold}},
+								line: {
+									color: 'rgb(256, 0, 0)',
+									width: 2
+								}
+							},
+							//line angle - Burndown
+							{
+								type: 'line',
+								x0: "{{data.codeCompleteDate|date('Y-m-d H:i:s')}}",
+								y0: {{data.failureThreshold}},
+								x1: "{{data.codeReleaseDate|date('Y-m-d H:i:s')}}",
+								y1: 0,
+								line: {
+									color: 'rgb(256, 0, 0)',
+									width: 2,
+									dash: 'dash'
+								}
+							},
+							{% if (data.stopTheLineDate) and (data.stopTheLineDate|date('Y-m-d') != "1970-01-01") %}
+							//line vertical - Stop the line
+							{
+								type: 'line',
+								x0: "{{data.stopTheLineDate|date('Y-m-d H:i:s')}}",
+								y0: 0,
+								x1: "{{data.stopTheLineDate|date('Y-m-d H:i:s')}}",
+								y1: {{(data.failureThreshold + 200)}},
+								line: {
+									color: 'rgb(0, 0, 256)',
+									width: 2,
+									dash: 'dashdot'
+								}
+							}
+							{% endif %}
+						],
+						annotations: [
+						{	
+							x: "{{data.codeCompleteDate|date('Y-m-d H:i:s')}}",
+							y: {{(data.failureThreshold + 200)}},
+							xref: 'x',
+							yref: 'y',
+							text: 'Code Complete ({{data.codeCompleteDate|date("j F H:i")}})',
+							showarrow: true,
+							arrowcolor: '#ff0000',
+							arrowhead: 2,
+							arrowsize: 1,
+							font: {
+								color: '#ff0000'
+							},
+							ax: 0,
+    						ay: -40
+						},
+						{
+							x: "{{data.codeReleaseDate|date('Y-m-d H:i:s')}}",
+							y: {{(data.failureThreshold + 200)}},
+							xref: 'x',
+							yref: 'y',
+							text: 'Deliver to BizOps ({{data.codeReleaseDate|date("j F H:i")}})',
+							showarrow: true,
+							arrowcolor: '#ff0000',
+							arrowhead: 2,
+							arrowsize: 1,
+							arrowwidth: 2,
+							font: {
+								color: '#ff0000'
+							},
+							ax: 0,
+    						ay: -40
+						},
+						{
+							x: "{{data.graphStartDate|date('Y-m-d H:i:s')}}",
+							y: {{data.failureThreshold}},
+							xref: 'x',
+							yref: 'y',
+							text: 'Failure Threshold',
+							showarrow: true,
+							arrowcolor: '#ff0000',
+							font: {
+								color: '#ff0000'
+							},
+							ax: 60,
+    						ay: -20
+						},
+						{
+							x: "{{data.codeCompleteDate|date('Y-m-d H:i:s')}}",
+							y: {{data.failureThreshold}},
+							xref: 'x',
+							yref: 'y',
+							text: 'Hardening Starts',
+							showarrow: true,
+							arrowcolor: '#ff0000',
+							font: {
+								color: '#ff0000'
+							},
+							ax: 60,
+    						ay: -20
+						},
+						{% if (data.stopTheLineDate) and (data.stopTheLineDate|date('Y-m-d') != "1970-01-01") %}
+						{
+							x: "{{data.stopTheLineDate|date('Y-m-d H:i:s')}}",
+							y: {{(data.failureThreshold) + 200}},
+							xref: 'x',
+							yref: 'y',
+							text: 'Stop the line',
+							showarrow: true,
+							arrowcolor: '#0000ff',
+							font: {
+								color: '#0000ff'
+							},
+							ax: 0,
+    						ay: -60
+						}
+						{% endif %}
+						]
+						{% endif %}
+					};
+					var traces = [{{data.plotdata}}];
+					var traces1 = [{"xaxis":"x","yaxis":"y","x":["2020-05-30T10:19:44.000Z","2020-05-30T10:22:40.000Z"],"y":[0,1],"name":"20.2.0-13R","text":["","1 of 1 (20.2.0-13R)"],"hoverinfo":"text","fill":"tozeroy"},
+						{"xaxis":"x","yaxis":"y","x":["2020-05-30T10:19:44.000Z","2020-05-30T10:22:40.000Z"],"y":[0,2],"name":"20.2.0-22R","text":["","1 of 1 (20.2.0-22R)"],"hoverinfo":"text","fill":"tonexty"},
+						{"xaxis":"x","yaxis":"y","x":["2020-05-30T10:19:44.000Z","2020-05-30T10:22:40.000Z"],"y":[1,3],"name":"20.2.0-4R","text":["1 of 1 (20.2.0-4R)","1 of 1 (20.2.0-4R)"],"hoverinfo":"text","fill":"tonexty"},
+						{"xaxis":"x","yaxis":"y","x":["2020-05-30T10:19:44.000Z","2020-05-30T10:22:40.000Z"],"y":[2,4],"name":"20.2.1-8R","text":["1 of 1 (20.2.1-8R)","1 of 1 (20.2.1-8R)"],"hoverinfo":"text","fill":"tonexty"},{
+						"xaxis":"x","yaxis":"y","x":["2020-05-30T10:19:44.000Z","2020-05-30T10:22:40.000Z"],"y":[2,5],"name":"20.2.1-33R","text":["","1 of 1 (20.2.1-33R)"],"hoverinfo":"text","fill":"tonexty"},
+						{"xaxis":"x","yaxis":"y","x":["2020-05-30T10:19:44.000Z","2020-05-31T09:49:41.000Z","2020-05-31T09:49:33.000Z","2020-05-31T09:48:18.000Z"],"y":[13,13,13,13],"name":"Smoke Tests","text":["","","c","d"],"hoverinfo":"y+text","mode":"lines+markers","marker":{"color":"red"},"type":"scatter"}];
+					Plotly.plot( plotarea, traces, layout, {displayModeBar: false});
+				</script>
+
+				<!-- Table -->
+				<h2>Latest Snapshot {{data.snapshotDateTime|date('j F Y H:i:s')}}</h2>
+				{% if data.totalExecuting > 0 %}
+					<div class="alert alert-danger" role="alert">
+						Warning: {{data.totalExecuting|number_format(0, '.', ',')}} tests currently executing and will not count as success or failures
+					</div>
+				{% endif %}	
+				{% if data.errorText %}
+					<div class="alert alert-danger" role="alert">
+						Please reload page: 
+							{{data.errorText}}
+					</div>
+				{% endif %}	
+				<table id="snapshots" class="table">
+					<thead>
+						<th style="width: 10%" class="text-left">Domain</th>
+						<th style="width: 15%" class="text-left">Team</th>
+						<th style="width: 15%" class="text-left">Release</th>
+						<th style="width: 15%" class="text-center">Total Duration (hr)</th>
+						<th style="width: 10%" class="text-center">Total Test</th>
+						<th style="width: 10%" class="text-center">Total Executing</th>
+						<th style="width: 10%" class="text-center">Total Success</th>
+						<th style="width: 10%" class="text-center">Total Failures</th>
+					</thead>
+					<tfoot>
+						<th class="text-left">Totals</th>
+						<th class="text-left"></th>
+						<th class="text-left"></th>
+						<th class="text-center">{{(data.totalDuration/1000/60/60)|number_format(2, '.', ',')}}</th>
+						<th class="text-center">{{data.totalTests|number_format(0, '.', ',')}}</th>
+						<th class="text-center">{{data.totalExecuting|number_format(0, '.', ',')}}</th>
+						<th class="text-center">{{data.totalSuccesses|number_format(0, '.', ',')}} ({{((1-data.totalFailures/data.totalTests)*100)|number_format(1, '.', ',')}}%)</th>
+						<th class="text-center">{{data.totalFailures|number_format(0, '.', ',')}} ({{((data.totalFailures/data.totalTests)*100)|number_format(1, '.', ',')}}%)</th>
+					</tfoot>
+					<tbody>
+					{% for snapshot in data.snapshots %}
+						<tr>
+							<td class="text-left">{{snapshot.domain}}</td>
+							<td class="text-left"><a href='/teams?team={{snapshot._id.team}}&host={{snapshot._id.host}}'>{{snapshot.team}}</a></td>
+							<td class="text-left">{{snapshot.release}}-{{snapshot.build}}</td>
+							<td class="text-center">{{(snapshot.totalDuration/1000/60/60)|number_format(2, '.', ',')}}</td>
+							<td class="text-center">{{snapshot.totalTests|number_format(0, '.', ',')}}</td>
+							<td class="text-center">{{snapshot.totalExecuting|number_format(0, '.', ',')}}</td>
+							<td class="text-center">{{snapshot.totalSuccesses|number_format(0, '.', ',')}}</td>
+							<td class="text-center" {% if snapshot.totalFailures > 0 or snapshot.totalExecuting > 0 %}bgcolor="#ffaaaa"{% else %}bgcolor="#aaffaa"{% endif %} >{{snapshot.totalFailures|number_format(0, '.', ',')}}</td>
+						</tr>
+					{% endfor %}
+					</tbody>
+				</table>
+				<script>
+					$(document).ready(function() {
+						$('#snapshots').DataTable( {
+							"order": [[ 7, "desc" ]],
+							"paging":   false,
+							"ordering": true,
+							"info":     false
+						} );
+					} );
+				</script>
+				<h2>Regression Failures</h2>
+				<table id="failures" class="table">
+					<thead>
+						<th style="width: 10%" class="text-left">Team</th>
+						<th style="width: 35%" class="text-left">Test</th>
+						<th style="width: 10%" class="text-left">Priority</th>
+						<th style="width: 10%" class="text-left">Release</th>
+						<th style="width: 15%" class="text-left">History</th>
+						<th style="width: 15%" class="text-left">Build Retries</th>
+						<th style="width: 5%" class="text-center">Sequential Failures</th>
+						<th style="width: 5%" class="text-center">Last Success</th>
+						<th style="width: 5%" class="text-center">Has Comment</th>
+						<th style="width: 5%" class="text-center">Release Blocker?</th>
+					</thead>
+					<tfoot>
+						<th class="text-left"></th>
+						<th class="text-left"></th>
+						<th class="text-left"></th>
+						<th class="text-left"></th>
+						<th class="text-left"></th>
+						<th class="text-center"></th>
+						<th class="text-center"></th>
+						<th class="text-center"></th>
+						<th class="text-center"></th>
+						<th class="text-center"></th>
+					</tfoot>
+					<tbody>
+					{% for failure in data.failures %}
+						<tr>
+							<td class="text-left"><a href='/teams?team={{failure.teamid}}&host={{failure.hostid}}'>{{failure.team|trim}}</a>
+							{% if failure.team|trim != failure.assignedteam|trim %}-><br><a href='/teams?team={{failure.assignedteamid}}&host={{failure.hostid}}'>{{failure.assignedteam}}</a>{% endif %}</td>
+							<td class="text-left" data-sort="{{failure.test}}"><a href='/results?test={{failure.testid}}&host={{failure.hostid}}&testautocomplete={{failure.test}}'>{{failure.test}}</a>
+							&nbsp<a href="{{failure.url}}/{{failure.test}}" target="_blank"><img src="images/external-link-2-16.gif" alt="Jenkins" style="width:12px;height:12px;border:0"></a><br>{{failure.comment}}</td>
+							<td class="text-left">{{ failure.priority }}</td>
+							<td>{{failure.release}}-{{failure.build}} #{{failure.executionid}}</td>
+							<td class="text-left" data-sort="{{failure.history}}">
+							{% for result in failure.history|split('') %}
+								{% if result == "S" %}
+									<span class="greendot"></span><span class="space"></span>
+								{% else %}
+									<span class="reddot"></span><span class="space"></span>
+								{% endif %}
+							{% endfor %}
+							{% if failure.isUnstable %}*{% endif %}
+							</td>
+							<td>0</td>
+							<td class="text-center">{{failure.sequentialFailureCount}}</td>
+							<td class="text-center" {% if failure.lastSuccessDateTime != null %}data-sort="{{failure.lastSuccessDateTime|date('y m d H:i:s')}}"{% endif %}>
+							{% if failure.lastSuccessDateTime %}
+								{% set lastSuccess = date(failure.lastSuccessDateTime|date('d-m-Y'))%}
+								{% set today = date() %}
+								{{((today|date("U") - lastSuccess|date("U")) / 86400)|round(0, 'floor')}} d
+							{%else %}{{'-'}}      
+							{% endif %}
+							<td class="text-center" data-sort="{{failure.comment|replace({"\"": "'"})}}">
+							{% if failure.comment %}
+								Yes
+							{% else %}
+								No
+							{% endif %}</td>
+							<td class="text-center" {% if failure.releaseblocker == "Yes" %}bgcolor="#ffaaaa"{% else %}bgcolor="#aaffaa"{% endif %} >{{failure.releaseblocker}}</td>
+						</tr>
+					{% endfor %}
+					</tbody>
+				</table>
+				<script>
+					$(document).ready(function() {
+						$('#failures').DataTable( {
+							"order": [[ 0, "asc" ]],
+							"lengthMenu": [[100, 200, 500, -1], [100, 200, 500, "All"]]
+						} );
+					} );
+				</script>
+
+			    <h2>Smoke Test Failures</h2>
+						<table id="smoketestsummary" class="table">
+						<thead>
+							<th style="width: 10%" class="text-left">Environment</th>
+							<th style="width: 25%" class="text-left">Description</th>
+							<th style="width: 25%" class="text-left">Test Date</th>
+							<th style="width: 5%" class="text-center">Total Duration (m)</th>
+							<th style="width: 5%" class="text-center">Total Tests</th>
+							<th style="width: 5%" class="text-center">Total Failures</th>
+							<th style="width: 5%" class="text-center">Total Success</th>
+							<th style="width: 5%" class="text-right">Percent Successful</th>
+						</thead>
+						<tfoot>
+							<th class="text-left"></th>
+							<th class="text-left"></th>
+							<th class="text-left"></th>
+							<th class="text-center"></th>
+							<th class="text-center"></th>
+							<th class="text-center"></th>
+							<th class="text-center"></th>
+							<th class="text-right"></th>
+						</tfoot>
+						<tbody>
+						{% for summary in data.smoketestsummary %}
+							<tr>
+								<td class="text-left"><a href='/smoketest?environment={{summary.environment}}'>{{summary.environment}}</a></td>
+								<td class="text-left">{{summary.release}}-{{summary.build}} #{{summary.executionId}}</td>
+								<td class="text-left" data-sort="{{summary.testDateTime|date('y m d H:i:s')}}">{{summary.testDateTime|date('j F Y H:i:s')}}</td>
+								<td class="text-center">{{(summary.totalDuration/1000/60)|number_format(2, '.', ',')}}</td>
+								<td class="text-center">{{summary.totalTests|number_format(0, '.', ',')}}</td>
+								<td class="text-center"><a href='/smoketest?environment={{summary.environment}}&result=FAILURE'>{{summary.totalFailures|number_format(0, '.', ',')}}</a></td>
+								<td class="text-center"><a href='/smoketest?environment={{summary.environment}}&result=SUCCESS'>{{summary.totalSuccesses|number_format(0, '.', ',')}}</a></td>
+								<td class="text-right" {% if ((summary.totalSuccesses/summary.totalTests)*100) < 100 %}bgcolor="#ffaaaa"{% else %}bgcolor="#aaffaa"{% endif %} >{{((summary.totalSuccesses/summary.totalTests)*100) |number_format(2, '.', ',')}}</td>
+							</tr>
+						{% endfor %}
+						</tbody>
+					</table>
+					<table id="smoketest" class="table">
+						<thead>
+							<th class="text-left" style="width: 10%">Team</th>
+							<th class="text-left" style="width: 50%">Smoke Test</th>
+							<th class="text-left" style="width: 10%">History</th>
+							<th class="text-center" style="width: 10%">Sequential Result</th>
+							<th class="text-center" style="width: 10%">Last Success</th>
+							<th class="text-center" style="width: 10%">Result</th>
+						</thead>
+						<tfoot>
+							<th class="text-left"></th>
+							<th class="text-left"></th>
+							<th class="text-left"></th>
+							<th class="text-center"></th>
+							<th class="text-center"></th>
+							<th class="text-center"></th>
+						</tfoot>
+						<tbody>
+						{% for smoketest in data.smoketestresults %}
+							<tr>
+								<td class="text-left"><a href='/teams?team={{smoketest.teamid}}&host={{smoketest.hostid}}'>{{smoketest.team|trim}}</a>
+								{% if smoketest.team|trim != smoketest.assignedteam|trim %}-><br><a href='/teams?team={{smoketest.assignedteamid}}&host={{smoketest.hostid}}'>{{smoketest.assignedteam}}</a>{% endif %}</td>
+								<td class="text-left"><b>{{smoketest.name}}</b>
+								{% if smoketest.response %}
+									<br>Response: {{smoketest.response}}<br>Failure: {{smoketest.failureMessage}}
+								{% endif %}</td>
+								<td class="text-left" data-sort="{{smoketest.history}}">
+								{% for result in smoketest.history|split('') %}
+									{% if result == "S" %}<span class="greendot"></span><span class="space"></span>{% else %}<span class="reddot"></span><span class="space"></span>{% endif %}
+								{% endfor %}
+								{% if smoketest.isUnstable %}*{% endif %}
+								</td>
+								<td class="text-center">{{smoketest.sequentialResultCount}}</td>
+								<td class="text-center" {% if smoketest.lastSuccessDateTime != null %}data-sort="{{smoketest.lastSuccessDateTime|date('y m d H:i:s')}}"{% endif %}>
+								{% if smoketest.lastSuccessDateTime %}
+									{% set lastSuccess = date(smoketest.lastSuccessDateTime|date('d-m-Y'))%}
+									{% set today = date() %}
+									{{((today|date("U") - lastSuccess|date("U")) / 86400)|round(0, 'floor')}} d
+								{% endif %}
+								<td class="text-center" {% if smoketest.result == "FAILURE" %}bgcolor="#ffaaaa"{% else %}bgcolor="#aaffaa"{% endif %} >{{smoketest.result}}</td>
+							</tr>
+						{% endfor %}
+						</tbody>
+					</table>
+				<script>
+					$(document).ready(function() {
+						$('#smoketest').DataTable( {
+							"order": [[ 1, "asc" ]],
+							"paging":   false,
+							"ordering": true,
+							"info":     true
+						} );
+					} );
+				</script>	
+
+				<h2>Frequent Comments</h2>
+				<table id="freqcomments" class="table">
+					<thead>
+						<th style="width: 10%" class="text-left">Assigned Team</th>
+						<th style="width: 80%" class="text-left">Comment</th>
+						<th style="width: 5%" class="text-center">Count</th>
+						<th style="width: 5%" class="text-center">Release Blocker?</th>
+					</thead>
+					<tfoot>
+						<th></th>
+						<th></th>
+						<th></th>
+						<th></th>
+					</tfoot>
+					<tbody>
+					{% for frequentComment in data.frequentComments %}
+						<tr>
+							<td class="text-left"><a href='/teams?team={{frequentComment.teamid}}'>{{frequentComment.team|trim}}</a>
+							{% if frequentComment.team|trim != frequentComment.assignedteam|trim %}-><br><a href='/teams?team={{frequentComment.assignedteamid}}'>{{frequentComment.assignedteam}}</a>{% endif %}</td>
+							<td class="text-left">{{frequentComment.comment}}</td>
+							<td class="text-center">{{frequentComment.count}}</td>
+							<td class="text-center"{% if frequentComment.releaseblocker == "Yes" %}bgcolor="#ffaaaa"{% else %}bgcolor="#aaffaa"{% endif %} >{{frequentComment.releaseblocker}}</td>
+						</tr>
+					{% endfor %}
+					</tbody>
+				</table>
+				<script>
+					$(document).ready(function() {
+						$('#freqcomments').DataTable( {
+							"order": [[ 2, "desc" ]],
+							"paging":   false,
+							"ordering": true,
+							"info":     true
+						} );
+					} );
+				</script>
+
+				<h2>Tag Failures</h2>
+				<table id="tagsummary" class="table">
+					<thead>
+						<th style="width: 10%" class="text-left">Tag</th>
+						<th style="width: 60%" class="text-left">Teams (* = has failures)</th>
+						<th style="width: 5%" class="text-center">Total Tests {{data.tagSummaries[0].currentRelease}}-{{data.tagSummaries[0].currentBuild}}</th>
+						<th style="width: 5%" class="text-center">Total Success</th>
+						<th style="width: 5%" class="text-center">Total Failures</th>
+						<th style="width: 5%" class="text-center">Percent Failure</th>
+						<th style="width: 5%" class="text-center">Failures since {{data.tagSummaries[0].previousRelease}}-{{data.tagSummaries[0].previousBuild}}</th>
+						<th style="width: 5%" class="text-center">Problem Area?</th>
+					</thead>
+					<tfoot>
+						<th></th>
+						<th></th>
+						<th></th>
+						<th></th>
+						<th></th>
+						<th></th>
+						<th></th>
+						<th></th>
+					</tfoot>
+					<tbody>
+					{% for tagSummary in data.tagSummaries %}
+						<tr>
+							<td class="text-left">{{tagSummary.tag}}</td>
+							<td class="text-left">{{tagSummary.teams}}</td>
+							<td class="text-center">{{tagSummary.currentTotalSuccesses + tagSummary.currentTotalFailures}}</td>
+							<td class="text-center">{{tagSummary.currentTotalSuccesses}}</td>
+							<td class="text-center">{{tagSummary.currentTotalFailures}}</td>
+							<td class="text-center">{{(tagSummary.currentTotalFailures/(tagSummary.currentTotalSuccesses+tagSummary.currentTotalFailures)*100)|number_format(2, '.', ',')}}%</td>
+							<td class="text-center" data-sort="{{tagSummary.currentTotalFailures - tagSummary.previousTotalFailures}}">
+							{% if tagSummary.currentTotalFailures - tagSummary.previousTotalFailures > 0 %}<span style='color:red;'>&#8679;&nbsp;{{tagSummary.currentTotalFailures - tagSummary.previousTotalFailures}}</span>{% endif %}
+							{% if tagSummary.currentTotalFailures - tagSummary.previousTotalFailures < 0 %}<span style='color:green;'>&#8681;&nbsp;{{tagSummary.currentTotalFailures - tagSummary.previousTotalFailures}}</span>{% endif %}
+							{% if tagSummary.currentTotalFailures - tagSummary.previousTotalFailures == 0 %}-{% endif %}
+							</td>
+							{% if (tagSummary.currentTotalFailures - tagSummary.previousTotalFailures >= 5) or 
+								((tagSummary.currentTotalFailures + tagSummary.currentTotalSuccesses >= 10) and
+								(tagSummary.currentTotalFailures/(tagSummary.currentTotalSuccesses+tagSummary.currentTotalFailures)*100 > 10))%}
+									<td class="text-center" bgcolor="#ffaaaa">Yes</td>
+							{% else %}
+								{% if tagSummary.currentTotalFailures == 0 %}
+									<td class="text-center" bgcolor="#aaffaa">No</td>
+								{% else %}
+									<td class="text-center" bgcolor="#ffffaa">Maybe</td>
+								{% endif %}	
+							{% endif %}						
+						</tr>
+					{% endfor %}
+					</tbody>
+				</table>
+				<script>
+					$(document).ready(function() {
+						$('#tagsummary').DataTable( {
+							"order": [[ 7, "desc"  ], [ 6, "desc"  ]],
+							"paging":   true,
+							"ordering": true,
+							"info":     true,
+							"lengthMenu": [[50, 100, 200, 500, -1], [50, 100, 200, 500, "All"]]
+						} );
+					} );
+				</script>
+				{% endif %}		
+			</div>
+        </div>
+	</div>
+{% endblock %}

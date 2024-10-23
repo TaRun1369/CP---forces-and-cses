@@ -1,0 +1,811 @@
+var keystone = require('keystone');
+var Mongoose = require('mongoose');
+var ObjectId = Mongoose.Types.ObjectId;
+var axios = require('axios');
+Test = keystone.list('Test');
+TestResult = keystone.list('TestResult');
+Snapshot = keystone.list('Snapshot');
+TagSummary = keystone.list('TagSummary');
+Team = keystone.list('Team');
+Host = keystone.list('Host');
+
+exports.parseJson = async function (req, res) {
+    var locals = res.locals;
+    var enableDebug = false;
+
+    locals.data = {
+        totalhours: 0,
+        teams: [],
+        hosts: [],
+        tests: [],
+        snapshots: [],
+        tagSummary: []   
+    };
+    
+    //Populate defaults from query parameters
+    locals.form = (req.method == 'POST') ? req.body : req.query;
+
+    //Load Teams from db
+    if (locals.data.teams.length == 0){
+        locals.data.teams = await loadTeams();
+    }
+
+    //Load Hosts from db
+    if (locals.data.hosts.length == 0){
+        locals.data.hosts = await loadHosts();
+    }
+    
+    //Get rid of milliseconds other wise can't find snapshots once host is updated via the UI (millis are truncated)
+    var snapshotdate = new Date();
+    snapshotdate.setMilliseconds(0);
+    
+    if (req.method === 'POST' &&  req.params.host !== "" && req.params.host.startsWith("QA") && process.env.REGRESSION_ANALYSIS_RESULT_URL) {
+		await postDataToRegressionAnalysis(req);
+	}
+
+    if (req.params.host != ""){
+        // Parse Selected Host
+        log("INFO", `Parsing Host: ${req.params.host}`);
+        for (var x = 0; x < locals.data.hosts.length; x++) {
+            var host = locals.data.hosts[x];
+            if (host.name == req.params.host){
+                enableDebug = host.enableDebug;
+                if (host.isEnabled){
+                    //Update with latest results
+                    await parseHost(host, locals.form, snapshotdate);
+                    //Remove assigned tests that are now passing
+                    await returnPassingTests(host, snapshotdate);
+                } else {
+                    log("INFO", `Host not enabled: ${host.name}`);
+                }
+            }
+        }
+    } 
+
+    log("INFO", `Parsing complete: ${req.params.host}`);
+    return res.apiResponse({success: true});
+
+    async function returnPassingTests(host, snapshotdate){
+        return new Promise(async function (fulfilled, rejected) {
+            log("INFO", `Return passing tests: ${host.name} ${snapshotdate}`);
+
+            //Get all assigned tests for host
+			var q = keystone.list('TestResult').model.aggregate([
+                {$match:
+                    {"team": {"$exists":true},
+                    "assignedTeam": {"$exists":true},
+                    "result": {$ne:"SUCCESS"},
+                    "host": new ObjectId(host.id)}},
+                    {$project: {
+                        "team":1,
+                        "assignedTeam":1,
+                        "test":1,
+                        "testDateTime":1,
+                        "host":1,
+                        "aEq": {"$eq":["$team","$assignedTeam"]}
+                    }
+                },
+                {$match:
+                    {"aEq": false}
+                },
+                {$lookup: 
+					{
+						from: "tests",
+						localField: "test",
+						foreignField: "_id",
+						as: "testobject"
+					}
+				},
+				{$lookup: 
+					{
+						from: "teams",
+						localField: "team",
+						foreignField: "_id",
+						as: "teamobject"
+					}
+                },
+                {$lookup: 
+					{
+						from: "teams",
+						localField: "assignedTeam",
+						foreignField: "_id",
+						as: "assignedteamobject"
+					}
+				},
+				{$group:
+					{ 
+                        _id: {id: "$_id", host: "$host", test: "$test"},
+						test: {$first: "$testobject.name"},
+						testid: {$first: "$test"},
+						team: {$first: "$teamobject.name"},
+                        teamid: {$first: "$team"},
+                        assignedteam: {$first: "$assignedteamobject.name"},
+						assignedteamid: {$first: "$assignedTeam"},
+                        testDateTime: {$first: "$testDateTime"}
+					}
+				}
+			]);
+			
+			q.exec(async function(err, results) {
+				try {
+                    //For each assigned tests load all results for the same host and test that were Successful
+                    //If there are >0 results then set the team back and add a comment
+                    log("INFO", `${results.length} test results assigned to other teams on ${host.name}`);
+                    for(var j = 0; j < results.length; j++){
+                        var successfulTest = await getSuccessfulTestResult(host._id, results[j].testid, results[j].testDateTime)                        
+                        if (successfulTest != null) {
+                            //Test has passed since this result so return assigned test back to the owner
+                            var comment = `${results[j].assignedteam}->${results[j].team} - Test returned as it passed on ${successfulTest.release}-${successfulTest.build} #${successfulTest.executionId} - Admin`;
+                            await returnTest(results[j]._id.id, results[j].teamid, results[j].test, comment);
+                        }
+                    }   
+				} catch (error) {
+                    log("INFO", `Error when returning passing tests: ${error}`);
+                }
+                fulfilled(true);
+			});
+
+            fulfilled(true);
+        });
+    }
+
+    async function parseHost(host, json, pollDateTime){
+        return new Promise(async function (fulfilled, rejected) {
+            let results = json;
+
+            //If there are no build details on the first x results then don't process the request
+            for(var i = 0; i < 5; i++) {
+                if (results.jobs[i].builds.length == 0){
+                    log("INFO", `Aborting due to no build records on test ${results.jobs[i].name}`);
+                    fulfilled(true);
+                    return;
+                }
+            }
+
+            var lastRelease = null;
+            var lastTestResultDate = null;
+
+            for(var i = 0; i < results.jobs.length; i++) {
+                var testName = results.jobs[i].name;
+                var testTags = results.jobs[i].description.substring(results.jobs[i].description.indexOf("Tags: ")+6);
+                var team = getTeam(testTags);
+
+                if (results.jobs[i].builds.length == 0){
+                    continue;
+                }
+
+                //Load test from database
+                var test = await loadTest(testName, testTags);
+
+                //Iterate through all builds
+                for(var j = 0; j < results.jobs[i].builds.length; j++) {
+                    //Mark running jobs as UNKNOWN (null result means its currently running)
+                    if (results.jobs[i].builds[j].result == null){
+                        results.jobs[i].builds[j].result = "UNKNOWN"
+                    }
+
+                    var releaseArray = results.jobs[i].builds[j].displayName.split("-");
+                    var snapshotRelease = releaseArray[1] != null ? releaseArray[1] : "?";
+                    var snapshotBuild = releaseArray[2] != null ? releaseArray[2] : "?R";
+                    var testDate = new Date(results.jobs[i].builds[j].timestamp);
+
+                    //Get the release version for the last test that was executed and save against the host
+                    if (snapshotRelease !== "?" && (lastTestResultDate == null || testDate >= lastTestResultDate)){
+                        lastTestResultDate = testDate;
+                        lastRelease = snapshotRelease;
+                        lastBuild = snapshotBuild;
+                    }
+
+                    //Create a new test result
+                    var newTestResult = new TestResult.model();
+                    newTestResult.pollDateTime = pollDateTime;
+                    newTestResult.host = host;
+                    newTestResult.test = test;
+                    newTestResult.team = team;
+                    newTestResult.assignedTeam = team;
+                    newTestResult.release = snapshotRelease;
+                    newTestResult.build = snapshotBuild;
+                    newTestResult.executionId = results.jobs[i].builds[j].id;
+                    newTestResult.duration = results.jobs[i].builds[j].duration;
+                    newTestResult.builtOn = results.jobs[i].builds[j].builtOn;
+                    newTestResult.result = results.jobs[i].builds[j].result;
+                    newTestResult.releaseBlocker = results.jobs[i].builds[j].result == "SUCCESS" ? "No" : "Yes";
+                    newTestResult.testDateTime = results.jobs[i].builds[j].timestamp;
+                    newTestResult.lastSuccessDateTime = results.jobs[i].builds[j].result == "SUCCESS" ? results.jobs[i].builds[j].timestamp : null;
+                    newTestResult.sequentialFailureCount = results.jobs[i].builds[j].result == "SUCCESS" ? 0: 1;
+//                    newTestResult.buildRetriesCount = results.jobs[i].builds[j].result == "SUCCESS" ? 0: 1;
+                    newTestResult.history = results.jobs[i].builds[j].result == "SUCCESS" ? "S" : "F";
+
+                    //Save any new tests that have run since last poll date i.e., testDateTime > hosts.lastPollDateTime and we know the result.
+                    if (testDate > host.lastPollDateTime && results.jobs[i].builds[j].result != "UNKNOWN"){
+                        //Copy forward any blocker information if the test release is the same to the latest test result
+                        //Once the test is successful the comment and blocker will not be brought forward onto the latest result
+                        if (results.jobs[i].builds[j].result !== "SUCCESS"){
+                            log("DEBUG", `Current result not successful: ${i} ${j} ${testName} #${newTestResult.executionId} ${newTestResult.release}-${newTestResult.build} ${newTestResult.result}`);
+                            var previousTestResult = await getPreviousTestResultInRelease(host, test, newTestResult.testDateTime, newTestResult.release);
+                            if (previousTestResult == null) {
+                                log("DEBUG", `Previous result not found: ${i} ${j} ${testName}`);
+                            } else {
+                                log("DEBUG", `Previous result found: ${i} ${j} ${testName} #${previousTestResult.executionId} ${previousTestResult.release}-${previousTestResult.build} ${previousTestResult.result}`);
+                                if(previousTestResult.release == snapshotRelease && 
+                                    previousTestResult.result !== "SUCCESS") {
+                                        log("DEBUG", `Copy previous results: Blocker: ${previousTestResult.releaseBlocker} Comments: ${previousTestResult.comment} Assigned to: ${previousTestResult.assignedTeam}`);
+                                        //Update new test with previous status
+                                        newTestResult.releaseBlocker = previousTestResult.releaseBlocker;
+                                        newTestResult.comment = previousTestResult.comment;
+                                        newTestResult.assignedTeam = previousTestResult.assignedTeam;
+                                        newTestResult.lastSuccessDateTime = previousTestResult.lastSuccessDateTime;
+                                        newTestResult.history += previousTestResult.history;
+                                        newTestResult.history = newTestResult.history.substring(0,20);
+                                        newTestResult.isUnstable = previousTestResult.isUnstable == true ? true : isUnstable(newTestResult.history);
+                                        if (previousTestResult.sequentialFailureCount != null) {
+                                            newTestResult.sequentialFailureCount += previousTestResult.sequentialFailureCount;
+                                        }
+                                    
+                                        //Remove comment from previousTestResult
+                                        if(previousTestResult.comment != "") {
+                                            previousTestResult.assignedTeam = previousTestResult.team;
+                                            previousTestResult.comment = "[" + formatDate(new Date()) + "] Comments moved to "+ newTestResult.release + "-" + newTestResult.build + " #" + newTestResult.executionId + " - Admin";
+                                            await saveTestResult(previousTestResult);
+                                        }
+                                } 
+                                if(previousTestResult.release == snapshotRelease && 
+                                    previousTestResult.result == "SUCCESS") {
+                                        newTestResult.history += previousTestResult.history;
+                                        newTestResult.history = newTestResult.history.substring(0,20);
+                                        newTestResult.lastSuccessDateTime = previousTestResult.lastSuccessDateTime;
+                                        newTestResult.isUnstable = previousTestResult.isUnstable == true ? true : isUnstable(newTestResult.history);
+                                }
+                            }
+                        } else {
+                            //Success
+                            var previousTestResult = await getPreviousTestResultInRelease(host, test, newTestResult.testDateTime, newTestResult.release);
+                            if (previousTestResult != null) {
+                                newTestResult.history += previousTestResult.history;
+                                newTestResult.history = newTestResult.history.substring(0,20);
+                                //5 Successful results in a row makes it stable
+                                newTestResult.isUnstable = newTestResult.history.substring(0,5) == "SSSSS" ? false : previousTestResult.isUnstable;
+                            } 
+                        }
+                        log("DEBUG", `Save new test result: ${i} ${j} ${testName}`); 
+                        
+                        await saveTestResult(newTestResult);
+                    } else {
+                        //If there is no new results for a test then go back to the last snapshot results and update the last polled date
+                        if (j == 0 && results.jobs[i].builds[j].result != "UNKNOWN") {
+                            //Load previous test result from the database
+                            var previousTestResult = await getPreviousTestResultInRelease(host, test, newTestResult.testDateTime, newTestResult.release);
+                            if (previousTestResult != null) {
+                                //Test result already exists so just update poll date time
+                                if (previousTestResult.release == snapshotRelease && 
+                                    previousTestResult.build == snapshotBuild &&
+                                    previousTestResult.executionId == results.jobs[i].builds[j].id &&
+                                    previousTestResult.result == results.jobs[i].builds[j].result){
+                                        previousTestResult.pollDateTime = pollDateTime;
+                                        if (previousTestResult.assignedTeam == null ){
+                                            previousTestResult.assignedTeam = team;
+                                        }
+                                        log("DEBUG", `Update existing test result pollDateTime: ${i} ${j} ${testName}`); 
+                                        await saveTestResult(previousTestResult);
+                                } else {
+                                    //Test result doesn't exist so create it
+                                    var message = `Save old test result that can't be matched: ${i} ${j} ${testName} `;
+                                    message += `Old: ${previousTestResult.release}-${previousTestResult.build} ${previousTestResult.result} ${previousTestResult.executionId} `;
+                                    message += `New: ${snapshotRelease}-${snapshotBuild} ${results.jobs[i].builds[j].result} ${results.jobs[i].builds[j].id}`;
+                                    log("DEBUG", message);
+                                    //The following is to resolve a defect where due to the test running at the same time as the snapshot the 
+                                    //test may be created without the previous tests history.  If the previous test was a failure then copy the 
+                                    //following to the new test releaseBlocker comment assignedTeam
+                                    if(previousTestResult.release == snapshotRelease && 
+                                        newTestResult.result !== "SUCCESS" &&
+                                        previousTestResult.result !== "SUCCESS" &&
+                                        previousTestResult.comment != "") {
+                                            log("DEBUG", `Update failure details: Blocker: ${previousTestResult.releaseBlocker} Comments: ${previousTestResult.comment} Assigned to: ${previousTestResult.assignedTeam}`);
+                                            newTestResult.assignedTeam = previousTestResult.assignedTeam;
+                                            newTestResult.comment = previousTestResult.comment;
+                                            newTestResult.releaseBlocker = previousTestResult.releaseBlocker;
+                                            
+                                            //Remove comment from previousTestResult
+                                            previousTestResult.assignedTeam = previousTestResult.team;
+                                            previousTestResult.comment = "[" + formatDate(new Date()) + "] Comments moved to "+ newTestResult.release + "-" + newTestResult.build + " #" + newTestResult.executionId + " - Admin";
+                                            await saveTestResult(previousTestResult);
+                                    }
+
+                                    if(previousTestResult.release == snapshotRelease &&
+                                        newTestResult.result !== "SUCCESS") {
+                                            log("DEBUG", `Update failure counter: Previous counter: ${previousTestResult.sequentialFailureCount} Last success: ${previousTestResult.lastSuccessDateTime}`);
+                                            newTestResult.lastSuccessDateTime = previousTestResult.lastSuccessDateTime;
+                                            newTestResult.isUnstable = previousTestResult.isUnstable 
+                                            if (previousTestResult.sequentialFailureCount != null) {
+                                                newTestResult.sequentialFailureCount += previousTestResult.sequentialFailureCount;
+                                            }
+                                    } 
+
+                                    //For Success or Failure update the history
+                                    newTestResult.history += previousTestResult.history;
+                                    newTestResult.history = newTestResult.history.substring(0,20);
+                                    
+                                    await saveTestResult(newTestResult);
+                                }
+                            } else {
+                                //Test doesn't exist so create it
+                                log("DEBUG", `Save old test result that can't be found: ${i} ${j} ${testName}`); 
+                                await saveTestResult(newTestResult);
+                            }
+                        }  
+
+                        //Test is currently running so update the last test result with the poll date so it appears in the list
+                        if (j == 0 && results.jobs[i].builds[j].result == "UNKNOWN") {
+                            //Load previous test result from the database
+                            var previousTestResult = await getPreviousTestResult(host, test, newTestResult.testDateTime);
+                            if (previousTestResult != null) {
+                                //Previous test result so update poll date time
+                                previousTestResult.pollDateTime = pollDateTime;
+                                log("DEBUG", `Update existing running test result pollDateTime: ${i} ${j} ${testName}`); 
+                                await saveTestResult(previousTestResult);
+                            }
+                        }
+                    }
+
+                    //Gather team snapshot stats for the first result only
+                    if (j == 0){
+                        var found = false;
+                        var success = results.jobs[i].builds[j].result == "SUCCESS" ? true : false;
+                        var executing = results.jobs[i].builds[j].result == "UNKNOWN" ? true : false;
+                        var failure = results.jobs[i].builds[j].result != "SUCCESS" && results.jobs[i].builds[j].result != "UNKNOWN" ? true : false;
+                    
+                        //See if snapshot alredy exists in memory
+                        for(let s = 0; s < locals.data.snapshots.length; s++) {
+                            if (locals.data.snapshots[s].team == team && 
+                                    locals.data.snapshots[s].release == snapshotRelease && 
+                                    locals.data.snapshots[s].build == snapshotBuild){
+                                found = true;
+                                
+                                //Update existing 
+                                let existingSnapshot = locals.data.snapshots[s];
+                                existingSnapshot.totalDuration = existingSnapshot.totalDuration + results.jobs[i].builds[j].duration;
+                                existingSnapshot.totalTests = existingSnapshot.totalTests + 1;
+                                existingSnapshot.totalSuccesses = success ? existingSnapshot.totalSuccesses + 1 : existingSnapshot.totalSuccesses;
+                                existingSnapshot.totalFailures = failure  ? existingSnapshot.totalFailures + 1 : existingSnapshot.totalFailures;
+                                existingSnapshot.totalExecuting = executing ? existingSnapshot.totalExecuting + 1 : existingSnapshot.totalExecuting;
+                                existingSnapshot.totalReleaseBlockers = failure || executing ? existingSnapshot.totalReleaseBlockers + 1 : existingSnapshot.totalReleaseBlockers;
+                                break;
+                            }
+                        }
+
+                        if (!found){
+                            //Create new snapshot
+                            let newSnapshot = new Snapshot.model();
+                            newSnapshot.snapshotDateTime = pollDateTime;
+                            newSnapshot.host = host;
+                            newSnapshot.team = team;
+                            newSnapshot.release = snapshotRelease;
+                            newSnapshot.build = snapshotBuild;
+                            newSnapshot.totalDuration = results.jobs[i].builds[j].duration;
+                            newSnapshot.totalTests = 1;
+                            newSnapshot.totalSuccesses = success ? 1 : 0;
+                            newSnapshot.totalFailures = failure ? 1 : 0;
+                            newSnapshot.totalExecuting = executing ? 1 : 0;
+                            newSnapshot.totalReleaseBlockers = success ? 0 : 1;
+                            locals.data.snapshots.push(newSnapshot);
+                        }
+                    }
+
+                    //Gather tag stats for the first result only
+                    if (j == 0){
+                        var success = results.jobs[i].builds[j].result == "SUCCESS" ? true : false;
+                        var executing = results.jobs[i].builds[j].result == "UNKNOWN" ? true : false;
+                        var failure = results.jobs[i].builds[j].result != "SUCCESS" && results.jobs[i].builds[j].result != "UNKNOWN" ? true : false;
+                    
+                        //Create a tag result entry for every tag on the test
+                        var tags = testTags.split(" ");
+                        for (var t = 0; t < tags.length; t++) {
+                            var found = false;
+                            var tag = tags[t];
+                            if (tag.substring(0,1) != "#" || tag.includes("#T-") || tag.includes("#Phase")){
+                                //Ignore Team tags and phases
+                                continue;
+                            }
+                            tag = tag.substring(0, tag.indexOf("#", 1) + 1);
+
+                            //See if tag stats alredy exists in memory
+                            for(let s = 0; s < locals.data.tagSummary.length; s++) {
+                                if (locals.data.tagSummary[s].tag == tag) {
+                                    found = true;
+                                    
+                                    //Update existing 
+                                    let existingTagSummary = locals.data.tagSummary[s];
+                                    existingTagSummary.currentTotalSuccesses = success ? existingTagSummary.currentTotalSuccesses + 1 : existingTagSummary.currentTotalSuccesses;
+                                    existingTagSummary.currentTotalFailures = failure  ? existingTagSummary.currentTotalFailures + 1 : existingTagSummary.currentTotalFailures;
+                                    if (!existingTagSummary.teams.includes(team.name)){
+                                        existingTagSummary.teams += ", " + team.name;
+                                        if (failure){
+                                            existingTagSummary.teams += "*";
+                                        }
+                                    } else {
+                                        //Add failure indicator if necssary
+                                        if (failure && !existingTagSummary.teams.includes(team.name + "*")){
+                                            var teams = existingTagSummary.teams.substring(0, existingTagSummary.teams.indexOf(team.name) + team.name.length) + "*";
+                                            teams += existingTagSummary.teams.substring(existingTagSummary.teams.indexOf(team.name) + team.name.length, existingTagSummary.teams.length);
+                                            existingTagSummary.teams = teams
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+
+                            if (!found){
+                                //Create new tagSummary
+                                let newTagSummary = new TagSummary.model();
+                                newTagSummary.snapshotDateTime = pollDateTime;
+                                newTagSummary.tag = tag;
+                                newTagSummary.host = host;
+                                newTagSummary.currentTotalSuccesses = success ? 1 : 0;
+                                newTagSummary.currentTotalFailures = failure ? 1 : 0;
+                                newTagSummary.teams = team.name;
+                                if (failure){
+                                    newTagSummary.teams += "*";
+                                }
+                                locals.data.tagSummary.push(newTagSummary);
+                            }
+                        }
+                    }
+                }
+            }
+
+            //Set the tagSummary release and build to the last test that executed
+            for (let s = 0; s < locals.data.tagSummary.length; s++) {
+                locals.data.tagSummary[s].currentRelease = lastRelease;
+                locals.data.tagSummary[s].currentBuild = lastBuild;
+            }
+            //Save tagSummary
+            await saveTagSummary(locals.data.tagSummary);
+            
+            //Save snapshots
+            await saveSnapshots(locals.data.snapshots);
+
+            //Update host
+            host.lastPollDateTime = pollDateTime;
+            host.lastRelease = lastRelease + "-" + lastBuild;
+            await saveHost(host);
+
+            fulfilled(true);
+        });
+    }
+
+    function isUnstable(history){
+        var count = ((history).match(/FS/g) || []).length;
+        return count >= 4 ? true : false;
+    }
+
+    function log(level, message){
+        var d = new Date();
+        if (level == "DEBUG") {
+            if (enableDebug){
+                console.log(d.toLocaleString() + " " + level + " " + message); 
+            }
+        } else {
+            console.log(d.toLocaleString() + " " + level + " " + message); 
+        }
+    }
+
+    
+    async function saveHost(host){
+        return new Promise(async function (fulfilled, rejected) {
+            var err = [];
+            await host.save(function(err) { 
+                if (err) {
+                    console.error(`Error updating Host: ${host.name} `);
+                    console.error(err);
+                } else {
+                    log("INFO", `saveHost: ${host.name}`);
+                }
+            });
+            fulfilled(err);
+        });
+    }
+
+    async function saveTestResult(newTestResult){
+        return new Promise(async function (fulfilled, rejected) {
+            var err = [];
+            await newTestResult.save(function(err) { 
+                if (err) {
+                    console.error(`Error adding new test result to the database: ${newTestResult.test.name}`);
+                    console.error(err);
+                } else {
+                    //console.log(`saveTestResult ${newTestResult.test} ${newTestResult.result}`);
+                }
+            });
+            fulfilled(err);
+        });
+    }
+
+    async function saveSnapshots(newSnapshots){
+        return new Promise(async function (fulfilled, rejected) {
+            var err = [];
+            for(let s = 0; s < newSnapshots.length; s++) {
+                var snapshot = newSnapshots[s];
+                await snapshot.save(function(err) { 
+                    if (err) {
+                        console.error(`Error adding new snapshot to the database: ${snapshot.release}-${snapshot.build} Host: ${snapshot.host.name} Team: ${snapshot.team.name}`);
+                        console.error(err);
+                    }
+                    else {
+                        log("INFO", `saveSnapshot ${snapshot.release} ${snapshot.build} Host: ${snapshot.host.name} Team: ${snapshot.team.name}`);
+                    }
+                });
+            }
+            fulfilled(err);
+        });
+    }
+
+    async function saveTagSummary(newTagSummary){
+        return new Promise(async function (fulfilled, rejected) {
+            var err = [];
+            for(let s = 0; s < newTagSummary.length; s++) {
+                var tagSummary = newTagSummary[s];
+                var existingTagSummary = await getTagSummary(tagSummary.host._id, tagSummary.tag)
+                if (existingTagSummary != null){
+                    //Update tag summary
+                    if (existingTagSummary.currentRelease == tagSummary.currentRelease &&
+                        existingTagSummary.currentBuild == tagSummary.currentBuild){
+                            //Update current data
+                            existingTagSummary.currentTotalSuccesses = tagSummary.currentTotalSuccesses;
+                            existingTagSummary.currentTotalFailures = tagSummary.currentTotalFailures;
+                    } else {
+                            //Move the current counts to the previous counts
+                            existingTagSummary.previousRelease = existingTagSummary.currentRelease;
+                            existingTagSummary.previousBuild = existingTagSummary.currentBuild;
+                            existingTagSummary.previousTotalSuccesses = existingTagSummary.currentTotalSuccesses;
+                            existingTagSummary.previousTotalFailures = existingTagSummary.currentTotalFailures;
+                            //Update current data
+                            existingTagSummary.currentRelease = tagSummary.currentRelease;
+                            existingTagSummary.currentBuild = tagSummary.currentBuild;
+                            existingTagSummary.currentTotalSuccesses = tagSummary.currentTotalSuccesses;
+                            existingTagSummary.currentTotalFailures = tagSummary.currentTotalFailures;
+                    }
+                    existingTagSummary.snapshotDateTime = tagSummary.snapshotDateTime;
+                    existingTagSummary.teams = tagSummary.teams;
+
+                    //Create new tag summary
+                    await existingTagSummary.save(function(err) { 
+                        if (err) {
+                            console.error(`Error updating tag summary to the database: ${existingTagSummary.currentRelease}-${existingTagSummary.currentBuild} Host: ${existingTagSummary.host} Tag: ${existingTagSummary.tag}`);
+                            console.error(err);
+                        }
+                        else {
+                            log("INFO", `Update Tag Summary ${existingTagSummary.currentRelease}-${existingTagSummary.currentBuild} Host: ${existingTagSummary.host} Tag: ${existingTagSummary.tag}`);
+                        }
+                    });
+            
+                } else {
+                    //Create new tag summary
+                    await tagSummary.save(function(err) { 
+                        if (err) {
+                            console.error(`Error adding new tag summary to the database: ${tagSummary.currentRelease}-${tagSummary.currentBuild} Host: ${tagSummary.host} Tag: ${tagSummary.tag}`);
+                            console.error(err);
+                        }
+                        else {
+                            log("INFO", `Save Tag Summary ${tagSummary.currentRelease}-${tagSummary.currentBuild} Host: ${tagSummary.host} Tag: ${tagSummary.tag}`);
+                        }
+                    });
+                }
+                }
+            fulfilled(err);
+        });
+    }
+
+    async function loadTest(testName, testTags){
+        return new Promise(function (fulfilled, rejected) {
+            var test = "";
+            var t = keystone.list('Test').model.findOne()
+            t.where('name').equals(testName)
+            t.select('_id name tags')
+            t.exec(function(err, result) {
+                if (result != null){
+                    //Update tags for the test if they have changed
+                    if (result.tags !== testTags){
+                        log("DEBUG",`Update tags from: ${result.tags} to ${testTags} for ${result.name}`);
+                        result.tags = testTags;
+                        saveTest(result);
+                    }
+                    test = result;
+                } else {
+                    //Create new test
+                    var newTest = new Test.model();
+                    newTest.name = testName;
+                    newTest.tags = testTags;
+                    test = saveTest(newTest);
+                }
+                fulfilled(test);
+            });
+        })
+    }
+
+    function saveTest(newTest){
+        var err = [];
+        newTest.save(function(err) { 
+            if (err) {
+                console.error(`Error adding new test to the database: ${newTest.name} ${newTest.tags}`);
+                console.error(err);
+            } else {
+                //console.log(`saveTest: ${newTest.name}`);
+            }
+        });
+        return newTest
+    }
+
+    async function loadHosts(){
+        return new Promise(function (fulfilled, rejected) {
+            var q = keystone.list('Host').model.find().select('_id name url isEnabled lastPollDateTime enableDebug').sort('name');
+            q.exec(function (err, results) {
+                fulfilled(results);
+            });
+        })
+    }
+
+    async function getPreviousTestResult(host, test, testDateTime){
+        return new Promise(function (fulfilled, rejected) {
+            var tr = keystone.list('TestResult').model.findOne()
+            tr.select('_id release build result testDateTime releaseBlocker comment team assignedTeam executionId sequentialFailureCount lastSuccessDateTime isUnstable history')
+            tr.where('test').equals(test._id)
+            tr.where('host').equals(host._id)
+            tr.where('testDateTime').lte(testDateTime)
+            tr.sort('-testDateTime')
+            tr.limit(1);
+            tr.exec(function (err, results) {
+                fulfilled(results);
+            }); 
+        }); 
+    }
+	
+	async function getPreviousTestResultInRelease (host, test, testDateTime, rel) {
+		return new Promise(function (fulfilled, rejected) {
+			var tr = keystone.list('TestResult').model.findOne();
+			tr.select('_id release build result testDateTime releaseBlocker comment team assignedTeam executionId sequentialFailureCount lastSuccessDateTime isUnstable history');
+			tr.where('test').equals(test._id); //checking for the same test
+			tr.where('host').equals(host._id); // checking for same QA env
+			tr.where('release').equals(rel); //checking in the same release
+			tr.where('testDateTime').lte(testDateTime);    // checking for previous tests 
+			tr.sort('-testDateTime'); //sorting by most recent
+			tr.limit(1); //taking the most recent record
+			tr.exec(function (err, results) {
+				fulfilled(results);
+			});
+		});
+	}
+
+    async function getTagSummary(host, tag){
+        return new Promise(function (fulfilled, rejected) {
+            var tr = keystone.list('TagSummary').model.findOne()
+            tr.select('_id tag host currentRelease currentBuild previousRelease previousBuild currentTotalSuccesses currentTotalFailures')
+            tr.where('tag').equals(tag)
+            tr.where('host').equals(host)
+            tr.exec(function (err, results) {
+                fulfilled(results);
+            }); 
+        }); 
+    }
+
+    async function getSuccessfulTestResult(host, test, startDate){
+        return new Promise(function (fulfilled, rejected) {
+            var tr = keystone.list('TestResult').model.findOne()
+            tr.select('_id release build result testDateTime releaseBlocker comment assignedTeam executionId')
+            tr.where('testDateTime').gt(startDate)
+            tr.where('result').equals("SUCCESS")
+            tr.where('test').equals(test)
+            tr.where('host').equals(host)
+            tr.sort('testDateTime')
+            tr.limit(1);
+            tr.exec(function (err, results) {
+                fulfilled(results);
+            }); 
+        }); 
+    }
+
+    async function returnTest(testResultId, assignedTeam, test, comment){
+        return new Promise(function (fulfilled, rejected) {
+            var t = keystone.list('TestResult').model.findOne()
+            t.where('_id').equals(testResultId)
+            t.exec(function(err, result) {
+                if (result != null){
+                    var err = [];
+                    //Set the team back to the owning team
+                    log("DEBUG",`Return: ${test} ${comment}`);
+                    result.comment = "[" + formatDate(new Date()) + "] " + comment + "<BR>" + result.comment;;
+                    result.assignedTeam = assignedTeam;
+                    result.save(function(err) { 
+                        if (err) {
+                            log("ERROR",`Error assigning test result back to owning team: ${err}`);
+                        }
+                    });
+                } else {
+                    log("ERROR",`Unable to find test result: ${testResultId}`);
+                }
+                fulfilled();
+            });
+        })
+    }
+
+    function formatDate(date) {
+        var monthNames = [
+          "Jan", "Feb", "Mar",
+          "Apr", "May", "Jun", "Jul",
+          "Aug", "Sep", "Oct",
+          "Nov", "Dec"
+        ];
+      
+        var day = date.getDate();
+        var monthIndex = date.getMonth();
+        var year = date.getFullYear();
+      
+        return day + '-' + monthNames[monthIndex] + '-' + year;
+    }
+
+
+    function getTeam(tags){
+        //Extract team name from tags
+        var teamTag
+        if (tags.indexOf("#T-") !== -1){
+            teamTag = tags.substring(tags.indexOf("#T-")+1);
+            teamTag = teamTag.substring(0, teamTag.indexOf("#"));
+            teamTag = teamTag.trim();
+        } else {
+            teamTag = "T-Unknown";
+        }
+
+        //See if team already exists
+        var team = null;
+        for (var i = 0, len = locals.data.teams.length; i < len; i++) {
+            if (locals.data.teams[i].tag == teamTag){
+                team = locals.data.teams[i];
+                break;
+            }
+        }
+
+        //If not exists create a new team
+        if (team == null){
+            team = createNewTeam(teamTag);
+            locals.data.teams.push(team);
+        }
+        return team;
+    }
+
+    function createNewTeam(teamName){
+        var err = [];
+        var newTeam = new Team.model();
+        newTeam.name = teamName;
+        newTeam.tag = teamName;
+        newTeam.ownerEmail = "grant.hansen@mastercard.com";
+        newTeam.escalationEmail = "grant.hansen@mastercard.com";
+        newTeam.save(function(err) { 
+            if (err) {
+                console.error(`Error adding new team to the database: ${teamName}`);
+                console.error(err);
+            }  else {
+                log("INFO", `createNewTeam ${teamName}`);
+            }
+        });
+        return newTeam;
+    }
+
+    async function loadTeams(){
+        return new Promise(function (fulfilled, rejected) {
+            var q = keystone.list('Team').model.find().select('_id name tag').sort('name');
+            q.exec(function (err, results) {
+                fulfilled(results);
+            });
+        });
+    }
+
+	async function postDataToRegressionAnalysis (req) {
+		log("INFO", `Sending data to Regression Analysis for Host: ${req.params.host}`);
+		var url = process.env.REGRESSION_ANALYSIS_RESULT_URL + `/${req.params.host}`;
+		axios.post(url, req.body, {timeout: 60000, maxContentLength: Infinity, maxBodyLength: Infinity}).then(res => {
+			log("INFO", `Regression results data has been processed by Regression Analysis for Host: ${req.params.host}`);
+		}).catch(err => {
+			log("ERROR", `${err.code} Error while processing regression result data by Regression Analysis, URL: ${url}`);
+		});
+	}
+
+};
